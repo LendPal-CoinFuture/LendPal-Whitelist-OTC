@@ -238,17 +238,91 @@ contract OtcTradeTest is Test {
         otc.refund(1);
     }
 
-    function test_settleRevertsUntilBothConfirmed() public {
+    function test_settleAfterPayerConfirmsOnce() public {
         uint256 amount = 50e6;
         vm.prank(owner);
         (uint256 tradeId, bytes32 tradeHash) = otc.openTrade(buyer, seller, amount, 1, ORDER_ID, 0);
         vm.prank(buyer);
         usdt.approve(address(otc), amount);
-        vm.prank(buyer);
-        otc.confirmTrade(tradeId, tradeHash);
         vm.expectRevert(OtcTrade.NotFullyConfirmed.selector);
         otc.settle(tradeId);
+
+        vm.prank(buyer);
+        otc.confirmTrade(tradeId, tradeHash);
+        otc.settle(tradeId);
+        assertEq(usdt.balanceOf(seller), 49.5e6);
+        assertEq(usdt.balanceOf(owner), 0.5e6);
         assertEq(usdt.balanceOf(address(otc)), 0);
+    }
+
+    function test_payOnceByPayerSplits99And1() public {
+        uint256 amount = 50e6;
+        vm.prank(buyer);
+        usdt.approve(address(otc), amount);
+        vm.prank(buyer);
+        (uint256 tradeId,) = otc.pay(seller, amount, 390e6, "S-261110-7702074f");
+        assertEq(usdt.balanceOf(seller), 49.5e6);
+        assertEq(usdt.balanceOf(owner), 0.5e6);
+        assertEq(usdt.balanceOf(buyer), 1_000_000e6 - amount);
+        (,,,,,,,,,, OtcTrade.TradeStatus status) = otc.getTrade(tradeId);
+        assertEq(uint8(status), uint8(OtcTrade.TradeStatus.Completed));
+        (address paidBuyer, address paidSeller, uint256 paidUsdt,,,, uint64 openedAt,, bool buyerOk, bool sellerOk,) =
+            otc.getTrade("S-261110-7702074f");
+        assertEq(paidBuyer, buyer);
+        assertEq(paidSeller, seller);
+        assertEq(paidUsdt, amount);
+        assertGt(openedAt, 0);
+        assertTrue(buyerOk);
+        assertFalse(sellerOk);
+    }
+
+    function test_payRejectsBadOrRepeatedOrderId() public {
+        uint256 amount = 50e6;
+        vm.startPrank(buyer);
+        usdt.approve(address(otc), amount * 2);
+        vm.expectRevert(OtcTrade.InvalidOrderId.selector);
+        otc.pay(seller, amount, 390e6, "order-1");
+        otc.pay(seller, amount, 390e6, "B-261110-7702074f");
+        vm.expectRevert(OtcTrade.OrderAlreadyUsed.selector);
+        otc.pay(seller, amount, 390e6, "B-261110-7702074f");
+        vm.stopPrank();
+        assertEq(usdt.balanceOf(buyer), 1_000_000e6 - amount);
+    }
+
+    function test_linkOrderReadsPreviousTradeWithoutMovingTokens() public {
+        uint256 amount = 50e6;
+        vm.prank(buyer);
+        usdt.approve(address(otc), amount);
+        vm.prank(buyer);
+        otc.pay(seller, amount, 389e2, "S-261110-7702074f");
+        uint256 sellerAfter = usdt.balanceOf(seller);
+
+        OtcTrade next = OtcTrade(
+            address(
+                new ERC1967Proxy(
+                    address(new OtcTrade()), abi.encodeCall(OtcTrade.initialize, (owner, address(registry)))
+                )
+            )
+        );
+        vm.startPrank(owner);
+        next.setUsdt(address(usdt));
+        next.setPreviousBook(address(otc));
+        next.linkOrder("S-261110-7702074f", 1);
+        vm.stopPrank();
+
+        (address linkedBuyer, address linkedSeller, uint256 linkedUsdt,,,,,,,,) =
+            next.getTrade("S-261110-7702074f");
+        assertEq(linkedBuyer, buyer);
+        assertEq(linkedSeller, seller);
+        assertEq(linkedUsdt, amount);
+        assertEq(usdt.balanceOf(seller), sellerAfter);
+        assertEq(usdt.balanceOf(address(next)), 0);
+
+        vm.prank(buyer);
+        usdt.approve(address(next), amount);
+        vm.prank(buyer);
+        vm.expectRevert(OtcTrade.OrderAlreadyUsed.selector);
+        next.pay(seller, amount, 389e2, "S-261110-7702074f");
     }
 
     function test_openTrade_revertsForNonOwner() public {

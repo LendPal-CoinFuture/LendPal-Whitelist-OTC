@@ -11,10 +11,10 @@ import {IAccessRegistry} from "./interfaces/IAccessRegistry.sol";
 
 /// @title OtcTrade
 /// @notice OTC 撮合。买方要买的标的在链下交付。合约不托管 USDT。
-///         双方确认后，settle 从付 U 的人钱包直接转两笔：对方拿剩余，平台拿手续费。
-///         钱不进入本合约。还没结算时，取消即可，没有款项要退。
+///         付 U 的人确认一次即可。pay 从付 U 的人钱包直接转两笔：对方拿剩余，平台拿手续费。
+///         收 U 的人不用签名。钱不进入本合约。
 ///         手续费默认 1%，超级管理员可改，最高 5%。开单时把当时的百分比锁进这一单。
-///         本实现永久关闭升级。平台 openTrade 锁定条款。买方、卖方各自 confirmTrade。
+///         本实现永久关闭升级。
 contract OtcTrade is Initializable, Ownable2StepUpgradeable, UUPSUpgradeable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -68,6 +68,15 @@ contract OtcTrade is Initializable, Ownable2StepUpgradeable, UUPSUpgradeable, Re
     /// @notice 每笔成交在开单时锁定的手续费百分比。0 表示这单开在本规则之前，按 1% 结算。
     mapping(uint256 tradeId => uint256 percent) private _lockedFeePercent;
 
+    /// @notice 上一版买卖合约。只用来按订单号读取已经记过的成交，不再从这里收款。
+    OtcTrade public previousBook;
+
+    /// @notice 本合约里按订单号找到的成交编号。订单号与后台一致，例如 S-261110-7702074f。
+    mapping(bytes32 orderKey => uint256 tradeId) private _tradeByOrder;
+
+    /// @notice 上一版合约里的成交编号。键同样是订单号的 keccak256。
+    mapping(bytes32 orderKey => uint256 tradeId) private _linkedOrder;
+
     error EthRejected();
     error UpgradeCalldataDisabled();
     error RenounceDisabled();
@@ -94,6 +103,10 @@ contract OtcTrade is Initializable, Ownable2StepUpgradeable, UUPSUpgradeable, Re
     error UpgradeDisabled();
     error FeeRecipientIsContract();
     error FeePercentOutOfRange();
+    error InvalidOrderId();
+    error OrderAlreadyUsed();
+    error PreviousBookMissing();
+    error PreviousBookSet();
 
     event TradeOpened(
         uint256 indexed tradeId,
@@ -303,12 +316,12 @@ contract OtcTrade is Initializable, Ownable2StepUpgradeable, UUPSUpgradeable, Re
         revert CustodyDisabled();
     }
 
-    /// @notice 双方都已确认时，按开单锁定的百分比从付 U 的人钱包直接转两笔。谁都可以调用。
-    ///         代币不进入本合约。
+    /// @notice 付 U 的人已经确认时，按开单锁定的百分比从他的钱包直接转两笔。谁都可以调用。
+    ///         收 U 的人不用确认。代币不进入本合约。
     function settle(uint256 tradeId) external nonReentrant {
         Trade storage t = _trades[tradeId];
         if (t.status != TradeStatus.Opened) revert TradeNotOpen();
-        if (!t.buyerConfirmed || !t.sellerConfirmed) revert NotFullyConfirmed();
+        if (!t.buyerConfirmed) revert NotFullyConfirmed();
         if (usdtToken == address(0)) revert UsdtNotSet();
         if (t.expiry != 0 && block.timestamp > t.expiry) revert TradeExpired();
         if (!registry.isWhitelisted(t.buyer)) revert BuyerNotWhitelisted();
@@ -323,6 +336,70 @@ contract OtcTrade is Initializable, Ownable2StepUpgradeable, UUPSUpgradeable, Re
         if (platformFee != 0) token.safeTransferFrom(t.buyer, wallet, platformFee);
         emit TradeSettled(tradeId, t.seller, wallet, sellerAmount, platformFee);
         emit TradeCompleted(tradeId, t.tradeHash);
+    }
+
+    /// @notice 记下上一版合约。只能设置一次。
+    function setPreviousBook(address book) external onlyOwner {
+        if (address(previousBook) != address(0)) revert PreviousBookSet();
+        if (book == address(0) || book == address(this)) revert ZeroAddress();
+        previousBook = OtcTrade(book);
+    }
+
+    /// @notice 把后台订单号对到上一版合约里已经付过的那一笔。不转币。
+    function linkOrder(string calldata orderId, uint256 previousTradeId) external onlyOwner {
+        if (address(previousBook) == address(0)) revert PreviousBookMissing();
+        bytes32 key = _orderKey(orderId);
+        if (_tradeByOrder[key] != 0 || _linkedOrder[key] != 0) revert OrderAlreadyUsed();
+        (,,,, bytes32 offchainOrderId,,,,,,) = previousBook.getTrade(previousTradeId);
+        if (offchainOrderId != key) revert HashMismatch();
+        _linkedOrder[key] = previousTradeId;
+    }
+
+    /// @notice 付 U 的人确认一次。从调用者钱包转出整笔：99% 给收 U 的人，1% 给平台。
+    /// @param orderId 后台订单号，例如 S-261110-7702074f。
+    function pay(
+        address receiver,
+        uint256 usdtAmount,
+        uint256 hkdAmount,
+        string calldata orderId
+    ) external nonReentrant returns (uint256 tradeId, bytes32 tradeHash) {
+        address payer = msg.sender;
+        requireWhitelistedPair(payer, receiver);
+        if (usdtAmount == 0 || hkdAmount == 0) revert ZeroAmount();
+        if (usdtToken == address(0)) revert UsdtNotSet();
+        address wallet = feeWallet();
+        if (wallet == address(this)) revert FeeRecipientIsContract();
+
+        bytes32 offchainOrderId = _orderKey(orderId);
+        if (_tradeByOrder[offchainOrderId] != 0 || _linkedOrder[offchainOrderId] != 0) revert OrderAlreadyUsed();
+
+        tradeHash = computeTradeHash(payer, receiver, usdtAmount, hkdAmount, offchainOrderId);
+        tradeId = ++tradeCount;
+        _tradeByOrder[offchainOrderId] = tradeId;
+        _trades[tradeId] = Trade({
+            buyer: payer,
+            seller: receiver,
+            usdtAmount: usdtAmount,
+            hkdAmount: hkdAmount,
+            offchainOrderId: offchainOrderId,
+            tradeHash: tradeHash,
+            openedAt: uint64(block.timestamp),
+            expiry: 0,
+            buyerConfirmed: true,
+            sellerConfirmed: false,
+            status: TradeStatus.Completed
+        });
+        _lockedFeePercent[tradeId] = currentFeePercent();
+
+        (uint256 platformFee, uint256 sellerAmount) = _split(usdtAmount, currentFeePercent());
+        IERC20 token = IERC20(usdtToken);
+        if (sellerAmount != 0) token.safeTransferFrom(payer, receiver, sellerAmount);
+        if (platformFee != 0) token.safeTransferFrom(payer, wallet, platformFee);
+
+        emit TradeOpened(tradeId, payer, receiver, usdtAmount, hkdAmount, offchainOrderId, tradeHash, 0);
+        emit TradeConfirmed(tradeId, payer, tradeHash);
+        emit TradeSettled(tradeId, receiver, wallet, sellerAmount, platformFee);
+        emit TradeCompleted(tradeId, tradeHash);
     }
 
     /// @notice 不再托管，因此没有可退的余额。调用会直接拒绝。
@@ -344,9 +421,9 @@ contract OtcTrade is Initializable, Ownable2StepUpgradeable, UUPSUpgradeable, Re
         emit TradeCancelled(tradeId, msg.sender);
     }
 
-    /// @notice 读取一笔成交的全部字段。
+    /// @notice 按成交编号读取一笔成交的全部字段。
     function getTrade(uint256 tradeId)
-        external
+        public
         view
         returns (
             address buyer,
@@ -377,5 +454,49 @@ contract OtcTrade is Initializable, Ownable2StepUpgradeable, UUPSUpgradeable, Re
             t.sellerConfirmed,
             t.status
         );
+    }
+
+    /// @notice 按后台订单号读取成交。订单号与数据库一致，例如 S-261110-7702074f。
+    function getTrade(string calldata orderId)
+        external
+        view
+        returns (
+            address buyer,
+            address seller,
+            uint256 usdtAmount,
+            uint256 hkdAmount,
+            bytes32 offchainOrderId,
+            bytes32 tradeHash,
+            uint64 openedAt,
+            uint64 expiry,
+            bool buyerConfirmed,
+            bool sellerConfirmed,
+            TradeStatus status
+        )
+    {
+        bytes32 key = _orderKey(orderId);
+        uint256 tradeId = _tradeByOrder[key];
+        if (tradeId != 0) return getTrade(tradeId);
+        uint256 linked = _linkedOrder[key];
+        if (linked == 0 || address(previousBook) == address(0)) revert TradeNotFound();
+        return previousBook.getTrade(linked);
+    }
+
+    /// @notice 后台订单号的键。格式是 S- 或 B-，加 6 位日期，加 8 位小写十六进制。
+    function _orderKey(string calldata orderId) internal pure returns (bytes32) {
+        bytes memory raw = bytes(orderId);
+        if (raw.length != 17) revert InvalidOrderId();
+        if (raw[0] != "S" && raw[0] != "B") revert InvalidOrderId();
+        if (raw[1] != "-" || raw[8] != "-") revert InvalidOrderId();
+        for (uint256 i = 2; i < 8; i++) {
+            if (raw[i] < "0" || raw[i] > "9") revert InvalidOrderId();
+        }
+        for (uint256 i = 9; i < 17; i++) {
+            bytes1 c = raw[i];
+            bool digit = c >= "0" && c <= "9";
+            bool hexLower = c >= "a" && c <= "f";
+            if (!digit && !hexLower) revert InvalidOrderId();
+        }
+        return keccak256(raw);
     }
 }

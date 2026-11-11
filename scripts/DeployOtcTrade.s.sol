@@ -26,6 +26,9 @@ contract DeployOtcTrade is Script {
             if (bytes(rawRegistry).length != 0) registry = vm.parseAddress(rawRegistry);
         }
 
+        address usdt = vm.envOr("USDT_TOKEN", address(0xaeb831366b23C6fd13aD39068017197478398e32));
+        address fee = vm.envOr("FEE_WALLET", address(0x4F9064DAAE146e8F712e7C178EFeDEb6dE7BAA53));
+
         vm.startBroadcast(key);
         implementation = address(new OtcTrade());
         proxy = address(
@@ -33,6 +36,8 @@ contract DeployOtcTrade is Script {
                 implementation, abi.encodeCall(OtcTrade.initialize, (initialOwner, registry))
             )
         );
+        OtcTrade(proxy).setUsdt(usdt);
+        OtcTrade(proxy).setFeeRecipient(fee);
         vm.stopBroadcast();
     }
 
