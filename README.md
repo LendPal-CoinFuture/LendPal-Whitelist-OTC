@@ -1,16 +1,17 @@
-# LendPal 白名单与买卖
+# LendPal 白名单、买卖与质押
 
-这个仓库有两份合约，都在 Sepolia（链 ID `11155111`）。
+这个仓库放三份合约，都针对 Sepolia（链 ID `11155111`）。
 
 - `AccessRegistry`：白名单。UUPS 代理，地址不变：`0x135Fb34eBAd72BB91932E22ff48Fa6963f0e5F9E`
 - `OtcTrade`：买卖。当前正在使用的代理：`0x23F57c925Dd94cB8b8f0Ab8269FC24e830DAe0A7`
+- `PledgeLoan`：质押。正在更新中。合约已经写在这个仓库，还没有部署，也还没有链上地址。
 
-白名单仍然可以升级。当前这份买卖实现已经永久关闭升级。再改买卖规则就要重新部署，不要对正在使用的代理调用升级。
+白名单仍然可以升级。当前这份买卖实现已经永久关闭升级。再改买卖规则就要重新部署，不要对正在使用的代理调用升级。质押不走买卖合约。
 
 ## 目录
 
-- `contracts/`：两份正式合约
-- `contracts/interfaces/`：买卖合约用来问「在不在白名单」的接口
+- `contracts/`：白名单、买卖、质押三份正式合约
+- `contracts/interfaces/`：买卖和质押用来问「在不在白名单」的接口
 - `contracts/test/`：测试用的 USDT，不用于生产
 - `scripts/`：部署和升级脚本
 - `test/`：Foundry 测试
@@ -66,3 +67,15 @@ forge script scripts/DeployOtcTrade.s.sol --rpc-url sepolia --broadcast
 ```
 
 已经部署的白名单代理用 `scripts/UpgradeAccessRegistry.s.sol` 升级，地址保持不变。
+
+## 质押
+
+正在更新中。法币在线下当面交付。合约不收手续费，也不把 USDT 留在合约里。
+
+质押方调用 `deliver(counterparty, principal, termDays, orderId)`，把整笔 USDT 从自己的钱包转给承接方。承接方之后调用 `repay(loanId)`，把同样数量的本金还给质押方。期限只能是 7、14、21、28 天。两边地址都要在白名单里。订单号只能用一次。
+
+前 7 天免息，之后按本金每天 0.1% 计息，计息天数不超过约定期限减 7 天。利息写在 `Repaid` 事件里，给线下的法币结算看。链上归还的是本金。
+
+调用前要先把测试 USDT `approve` 给这份质押合约。不要把 USDT 直接转到合约地址，也不要用买卖合约的 `pay` 做质押。买卖的 `deposit` 和 `refund` 已经关闭。
+
+这份合约还没部署。部署之前，用户端的链上转账先停着。
